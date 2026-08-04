@@ -16,12 +16,16 @@ from flowcept.flowceptor.adapters.tensorboard.tensorboard_dataclasses import (
 from flowcept.flowceptor.adapters.dask.dask_dataclasses import (
     DaskSettings,
 )
+from flowcept.flowceptor.adapters.timm.timm_dataclasses import (
+    TimmSettings,
+)
 
 
 SETTINGS_CLASSES = {
     Vocabulary.Settings.MLFLOW_KIND: MLFlowSettings,
     Vocabulary.Settings.TENSORBOARD_KIND: TensorboardSettings,
     Vocabulary.Settings.DASK_KIND: DaskSettings,
+    Vocabulary.Settings.TIMM_KIND: TimmSettings,
 }
 
 

@@ -173,3 +173,9 @@ adapters:
     worker_should_get_output: true
     scheduler_create_timestamps: true
     worker_create_timestamps: false
+
+  timm: # Vision Transformer attention capture (see flowceptor/adapters/timm/). Optional:
+        # TimmInterceptor works with zero settings.yaml configuration (defaults to
+        # reduction: incoming_mean); add this block only to override that default.
+    kind: timm
+    reduction: incoming_mean # or "cls" -- see VisionTransformer.get_patch_attention_scores

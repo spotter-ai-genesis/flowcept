@@ -69,6 +69,12 @@ nvidia = ["nvidia-ml-py"]
 amd = ["amdsmi"]
 mqtt = ["paho-mqtt"]
 tensorboard = ["tensorboard", "tensorflow", "tbparse"]
+# Only needs torch (for nn.Module.register_forward_hook). No dependency on timm
+# itself: TimmInterceptor.attach() duck-types the module at runtime instead of
+# pinning a hard import-time dependency, since the actual target is a specific
+# instrumented fork (set_attn_capture/get_patch_attention_scores) that isn't a
+# published PyPI package.
+timm = ["torch"]
 llm_agent = ["mcp[cli]", "langchain_community", "langchain_openai", "langgraph", "streamlit", "PyMuPDF", "matplotlib", "tabulate"]
 llm_google = ["flowcept[llm_agent]", "google-genai"]
 llm_agent_audio = ["flowcept[llm_agent]", "streamlit-mic-recorder", "SpeechRecognition", "pydub", "gTTS"]
@@ -111,6 +117,7 @@ all = [
     "flowcept[mlflow]",
     "flowcept[mqtt]",
     "flowcept[tensorboard]",
+    "flowcept[timm]",
     "flowcept[report_pdf]",
     "flowcept[dev]",
     "flowcept[llm_agent]",

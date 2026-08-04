@@ -61,6 +61,10 @@ class BaseInterceptor(object):
             from flowcept.flowceptor.adapters.instrumentation_interceptor import InstrumentationInterceptor
 
             return InstrumentationInterceptor.get_instance()
+        elif kind == "timm":
+            from flowcept.flowceptor.adapters.timm.timm_interceptor import TimmInterceptor
+
+            return TimmInterceptor.get_instance()
         else:
             raise NotImplementedError
 

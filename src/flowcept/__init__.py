@@ -73,6 +73,13 @@ def __getattr__(name):
 
         return FlowceptDaskWorkerAdapter
 
+    elif name == "TimmInterceptor":
+        from flowcept.flowceptor.adapters.timm.timm_interceptor import (
+            TimmInterceptor,
+        )
+
+        return TimmInterceptor
+
     elif name == "SETTINGS_PATH":
         from flowcept.configs import SETTINGS_PATH
 
@@ -82,6 +89,7 @@ def __getattr__(name):
 
 __all__ = [
     "FlowceptDaskWorkerAdapter",
+    "TimmInterceptor",
     "flowcept_task",
     "FlowceptLoop",
     "FlowceptLightweightLoop",
