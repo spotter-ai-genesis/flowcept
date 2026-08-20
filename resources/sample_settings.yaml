@@ -179,3 +179,9 @@ adapters:
         # reduction: incoming_mean); add this block only to override that default.
     kind: timm
     reduction: incoming_mean # or "cls" -- see VisionTransformer.get_patch_attention_scores
+
+  vllm: # KV cache per-token importance capture (see flowceptor/adapters/vllm/). Optional:
+        # VLLMInterceptor works with zero settings.yaml configuration; add this
+        # block only to override the default activity_id.
+    kind: vllm
+    activity_id: kv_token_importance
