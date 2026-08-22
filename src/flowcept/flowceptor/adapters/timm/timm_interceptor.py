@@ -153,13 +153,27 @@ class TimmInterceptor(BaseInterceptor):
         actually provide, rather than the generic `*args, **kwargs`.
         """
         from flowcept.flowcept_api.flowcept_controller import Flowcept
+        from flowcept.instrumentation.flowcept_task import (
+            get_current_context_agent_id,
+            get_current_context_campaign_id,
+            get_current_context_task_id,
+            get_current_context_workflow_id,
+        )
 
         started_at = time()
         task_msg = TaskObject()
         task_msg.task_id = str(started_at)
         task_msg.activity_id = activity_id
-        task_msg.workflow_id = Flowcept.current_workflow_id
-        task_msg.campaign_id = Flowcept.campaign_id
+        # Prefer the enclosing task's workflow/campaign over Flowcept's class attributes: those
+        # track whichever controller started last, which is the wrong workflow when one long-lived
+        # controller drives several (e.g. a per-plan workflow under a persistent agent workflow).
+        task_msg.workflow_id = get_current_context_workflow_id() or Flowcept.current_workflow_id
+        task_msg.campaign_id = get_current_context_campaign_id() or Flowcept.campaign_id
+        # Nest under whatever task the forward pass ran inside, when there is one, so captured
+        # attention is a child of the enclosing task rather than a bare sibling under the workflow.
+        task_msg.parent_task_id = get_current_context_task_id()
+        # Same rationale: attribute the capture to whichever agent is driving the enclosing task.
+        task_msg.agent_id = get_current_context_agent_id()
         task_msg.started_at = started_at
         task_msg.status = Status.FINISHED
 
