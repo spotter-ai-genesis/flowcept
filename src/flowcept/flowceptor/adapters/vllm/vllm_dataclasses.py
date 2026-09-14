@@ -21,7 +21,7 @@ class VLLMSettings(BaseSettings):
 
     key: str = "vllm"
     kind: str = "vllm"
-    activity_id: str = "kv_token_importance"
+    activity_id: str = None  # per-connector; set by the caller or settings.yaml
 
     def __post_init__(self):
         """Set attributes after init."""

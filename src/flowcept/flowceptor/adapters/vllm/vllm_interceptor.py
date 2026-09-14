@@ -1,10 +1,15 @@
-"""vLLM (KV cache token importance) interceptor module.
+"""vLLM per-token provenance interceptor module.
 
-Captures a per-token importance score for every request served by vLLM, taken
-from the KV cache at the moment the request finishes -- as produced by the
-out-of-tree `vllm_kvnorm` KV connector. No application-level task/workflow code
-is required at the call site: once vLLM is started with that connector
-configured, every completed request transparently emits a Flowcept task.
+Captures one or more per-token series for every request served by vLLM, as
+produced by an out-of-tree `KVConnector`. The adapter is deliberately agnostic
+about which connector produced them and what they mean: it receives named
+float series plus a metadata dict and records them as a Flowcept task. Known
+producers include `vllm_kvnorm` (raw K/V L2 norms) and `vllm_expected_attn`
+(expected-attention importance), but nothing here is specific to either.
+
+No application-level task/workflow code is required at the call site: once vLLM
+is started with such a connector configured, every completed request
+transparently emits a Flowcept task.
 
 This mirrors the Dask adapter's architecture rather than the timm one. The timm
 adapter attaches a forward hook inside the caller's own process; vLLM instead
@@ -20,7 +25,7 @@ base flowcept install.
 """
 
 from time import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from flowcept.commons.flowcept_dataclasses.task_object import TaskObject
 from flowcept.commons.flowcept_dataclasses.workflow_object import WorkflowObject
@@ -29,14 +34,12 @@ from flowcept.flowceptor.adapters.base_interceptor import BaseInterceptor
 
 
 class VLLMInterceptor(BaseInterceptor):
-    """Interceptor that captures per-token KV importance scores from vLLM.
+    """Interceptor that captures per-token series emitted by a vLLM KVConnector.
 
-    The scores use the PagedEviction proxy (Chitty-Venkata et al., Findings of
-    EACL 2026, arXiv:2509.04377): ``mean(||V_i||_2 / ||K_i||_2)`` over layers
-    and KV heads. High score means the token is important -- a key's L2 norm is
-    inversely proportional to its cumulative attention (Devoto et al. 2024,
-    arXiv:2406.11430). The proxy exists so that no attention weights, and hence
-    no FlashAttention kernel changes, are needed.
+    The adapter imposes no meaning on the series. A connector passes whatever
+    it measured -- one list, or several named lists of equal length -- together
+    with a metadata dict describing the metric. `activity` lets the connector
+    label its own records so several connectors can coexist in one store.
 
     Examples
     --------
@@ -46,10 +49,11 @@ class VLLMInterceptor(BaseInterceptor):
     >>> interceptor.send_model_workflow("my-workflow-id", {"model": "facebook/opt-125m"})
     >>> interceptor.capture_request(
     ...     workflow_id="my-workflow-id",
-    ...     request_id="0-abc",
-    ...     scores=[0.13, 0.16, 0.14],
-    ...     prompt_token_ids=[2, 133, 812],
-    ...     metadata={"num_layers": 12},
+    ...     request_id="0-abc:g0",
+    ...     series={"k_avg": [12.4, 30.0], "v_avg": [1.05, 10.8]},
+    ...     prompt_token_ids=[2, 133],
+    ...     metadata={"metric": "kv_l2_norms", "num_layers": 12},
+    ...     activity="kv_token_importance",
     ... )
     """
 
@@ -110,10 +114,11 @@ class VLLMInterceptor(BaseInterceptor):
         self,
         workflow_id: str,
         request_id: str,
-        scores: List[float],
+        series: Union[List[float], Dict[str, List[float]]],
         prompt_token_ids: List[int],
         metadata: Dict[str, Any],
         started_at: Optional[float] = None,
+        activity: Optional[str] = None,
     ) -> TaskObject:
         """Build a TaskObject for one finished vLLM request.
 
@@ -121,12 +126,19 @@ class VLLMInterceptor(BaseInterceptor):
         `NotImplementedError`) with the params `callback`/`capture_request`
         actually provide, rather than the generic `*args, **kwargs`.
         """
-        activity_id = getattr(self.settings, "activity_id", None) or "kv_token_importance"
+        # Precedence: what the connector asked for, then settings.yaml, then a
+        # neutral default. Distinct activities let several connectors write into
+        # one store without their records being conflated.
+        activity_id = (
+            activity
+            or getattr(self.settings, "activity_id", None)
+            or "vllm_token_series"
+        )
 
         task_msg = TaskObject()
         task_msg.task_id = request_id
         task_msg.activity_id = activity_id
-        task_msg.subtype = "kv_token_importance"
+        task_msg.subtype = activity_id
         task_msg.workflow_id = workflow_id
         task_msg.status = Status.FINISHED
         task_msg.started_at = started_at if started_at is not None else time()
@@ -134,13 +146,46 @@ class VLLMInterceptor(BaseInterceptor):
 
         # prompt_token_ids is the model input; decode it with the tokenizer
         # recorded on the workflow to recover text.
+        # One per-token series or several named ones. A bare list is kept under
+        # `score` so older consumers are unaffected; a dict is passed through
+        # under its own keys, whatever the connector chose to call them.
+        if isinstance(series, dict):
+            generated = dict(series)
+            # A value is either a per-token series (flat) or a matrix whose rows
+            # are per-token (e.g. one row per decode step). Only the flat ones
+            # define the token count, and only they must agree with each other.
+            flat = {k: v for k, v in series.items()
+                    if not (v and isinstance(v[0], (list, tuple)))}
+            lengths = {len(v) for v in flat.values()}
+            if len(lengths) > 1:
+                raise ValueError(
+                    f"per-token series must be equal length, got "
+                    f"{ {k: len(v) for k, v in flat.items()} }"
+                )
+            num_computed = lengths.pop() if lengths else 0
+            for key, value in series.items():
+                if key in flat or not value:
+                    continue
+                # Matrices are rectangular, but their row width is the
+                # connector's business: [decode steps x prefill tokens] and
+                # [decode steps x top_k] are both legitimate, so do not tie the
+                # width to the per-token count.
+                widths = {len(row) for row in value}
+                if len(widths) > 1:
+                    raise ValueError(
+                        f"matrix {key!r} is ragged: row widths {sorted(widths)}"
+                    )
+        else:
+            generated = {"score": series}
+            num_computed = len(series)
+
         task_msg.used = {
             "request_id": request_id,
             "prompt_token_ids": prompt_token_ids,
             "num_prompt_tokens": len(prompt_token_ids),
-            "num_computed_tokens": len(scores),
+            "num_computed_tokens": num_computed,
         }
-        task_msg.generated = {"score": scores}
+        task_msg.generated = generated
         task_msg.custom_metadata = metadata
 
         if self.telemetry_capture is not None:
@@ -152,22 +197,26 @@ class VLLMInterceptor(BaseInterceptor):
         self,
         workflow_id: str,
         request_id: str,
-        scores: List[float],
+        series: Union[List[float], Dict[str, List[float]]],
         prompt_token_ids: List[int],
         metadata: Dict[str, Any],
         started_at: Optional[float] = None,
+        activity: Optional[str] = None,
     ) -> None:
         """Capture one finished request. Convenience wrapper over `callback`."""
-        self.callback(workflow_id, request_id, scores, prompt_token_ids, metadata, started_at)
+        self.callback(
+            workflow_id, request_id, series, prompt_token_ids, metadata, started_at, activity
+        )
 
     def callback(
         self,
         workflow_id: str,
         request_id: str,
-        scores: List[float],
+        series: Union[List[float], Dict[str, List[float]]],
         prompt_token_ids: List[int],
         metadata: Dict[str, Any],
         started_at: Optional[float] = None,
+        activity: Optional[str] = None,
     ) -> None:
         """Decide what to do when a request finishes.
 
@@ -176,7 +225,7 @@ class VLLMInterceptor(BaseInterceptor):
         since a completed request is unconditionally worth recording.
         """
         task_msg = self.prepare_task_msg(
-            workflow_id, request_id, scores, prompt_token_ids, metadata, started_at
+            workflow_id, request_id, series, prompt_token_ids, metadata, started_at, activity
         )
         self.intercept(task_msg.to_dict())
 
