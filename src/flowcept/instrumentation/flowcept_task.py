@@ -324,3 +324,47 @@ def flowcept_task(func=None, **decorator_kwargs):
 def get_current_context_task_id():
     """Retrieve the current task object from thread-local storage."""
     return getattr(_thread_local, "_flowcept_current_context_task_id", None)
+
+
+def get_current_context_workflow_id():
+    """Retrieve the workflow id of the current context task from thread-local storage."""
+    return getattr(_thread_local, "_flowcept_current_context_workflow_id", None)
+
+
+def get_current_context_campaign_id():
+    """Retrieve the campaign id of the current context task from thread-local storage."""
+    return getattr(_thread_local, "_flowcept_current_context_campaign_id", None)
+
+
+def get_current_context_agent_id():
+    """Retrieve the agent id of the current context task from thread-local storage."""
+    return getattr(_thread_local, "_flowcept_current_context_agent_id", None)
+
+
+def set_current_context(task_id, workflow_id=None, campaign_id=None, agent_id=None):
+    """Set the current context task in thread-local storage.
+
+    Carries the workflow and campaign alongside the task id because
+    ``Flowcept.current_workflow_id`` is a *class* attribute reflecting whichever
+    controller started last. A task running under an explicitly-passed
+    workflow_id -- one long-lived controller driving several workflows -- would
+    otherwise have anything captured inside it filed under the wrong workflow.
+
+    Returns the previous (task_id, workflow_id, campaign_id, agent_id) so callers
+    entering a scoped context (e.g. FlowceptTask) can restore it on exit instead
+    of leaving a stale context behind for whatever runs next on this thread.
+
+    Thread-local, so concurrent tasks -- Parsl's local_threads executor, for
+    instance -- each keep their own current context.
+    """
+    previous = (
+        get_current_context_task_id(),
+        get_current_context_workflow_id(),
+        get_current_context_campaign_id(),
+        get_current_context_agent_id(),
+    )
+    _thread_local._flowcept_current_context_task_id = task_id
+    _thread_local._flowcept_current_context_workflow_id = workflow_id
+    _thread_local._flowcept_current_context_campaign_id = campaign_id
+    _thread_local._flowcept_current_context_agent_id = agent_id
+    return previous

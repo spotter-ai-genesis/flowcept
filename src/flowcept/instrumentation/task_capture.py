@@ -12,6 +12,7 @@ from flowcept.configs import INSTRUMENTATION_ENABLED, REPLACE_NON_JSON_SERIALIZA
 from flowcept.flowcept_api.flowcept_controller import Flowcept
 from flowcept.flowceptor.adapters.instrumentation_interceptor import InstrumentationInterceptor
 from flowcept.commons.utils import replace_non_serializable
+from flowcept.instrumentation.flowcept_task import set_current_context
 
 
 class FlowceptTask(object):
@@ -192,11 +193,25 @@ class FlowceptTask(object):
         return self._task.agent_id
 
     def __enter__(self):
+        # Publish this task as the thread's current context, so anything captured inside the
+        # block -- @flowcept_torch, adapters hooked into third-party frameworks -- can pick it
+        # up as its parent. The @flowcept_task decorator already does this; without it here,
+        # work nested under a FlowceptTask was recorded with no parent at all.
+        if not self._ended:
+            self._previous_context = set_current_context(
+                self._task.task_id,
+                self._task.workflow_id,
+                self._task.campaign_id,
+                self._task.agent_id,
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not self._ended:
             self.end()
+        if hasattr(self, "_previous_context"):
+            set_current_context(*self._previous_context)
+            del self._previous_context
 
     def _gen_task_id(self):
         pid = os.getpid()
