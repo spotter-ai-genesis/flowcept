@@ -1,35 +1,36 @@
-"""vLLM per-token provenance interceptor module.
+"""Flowcept adapter for vLLM KV connectors.
 
-Captures one or more per-token series for every request served by vLLM, as
-produced by an out-of-tree `KVConnector`. The adapter is deliberately agnostic
-about which connector produced them and what they mean: it receives named
-float series plus a metadata dict and records them as a Flowcept task. Known
-producers include `vllm_kvnorm` (raw K/V L2 norms) and `vllm_expected_attn`
-(expected-attention importance), but nothing here is specific to either.
+Records one task per served request. The attention statistics themselves are
+written by the connector to a SafeTensors file; this adapter records the
+reference, so a record stays a fixed ~1.6 KB whatever the prompt length.
+Carrying them inline did not scale -- a 128k-context request serialises to
+hundreds of megabytes of JSON, past what a message queue will accept.
 
-No application-level task/workflow code is required at the call site: once vLLM
-is started with such a connector configured, every completed request
-transparently emits a Flowcept task.
+Connector settings that are constant for a run go on the workflow
+(`attention_config`), not on every task.
 
-This mirrors the Dask adapter's architecture rather than the timm one. The timm
-adapter attaches a forward hook inside the caller's own process; vLLM instead
-runs its scheduler and workers in a separate EngineCore process, so this
-interceptor is constructed *there*, buffers into its own MQ connection, and is
-handed the workflow id explicitly -- exactly as Dask worker plugins are. The
-extension point used is vLLM's own `KVConnector` interface, not something
-Flowcept invents.
-
-This adapter has no import-time dependency on vLLM or on `vllm_kvnorm`: it
-receives plain Python data structures, so it is importable and testable in a
-base flowcept install.
+    interceptor.send_model_workflow(
+        "my-workflow-id", {"model": "facebook/opt-125m"},
+        attention_config={"metric": "decode_attention", "top_pct": 10},
+    )
+    interceptor.capture_request(
+        workflow_id="my-workflow-id",
+        request_id="cmpl-abc:g0",
+        attention_stats={"uri": "file:///prov/cmpl-abc_g0.safetensors",
+                         "format": "safetensors", "bytes": 23688,
+                         "tensors": {"attn_sum": {"shape": [953],
+                                                  "dtype": "float32"}}},
+        num_prompt_tokens=953,
+        num_decode_tokens=8,
+        activity="decode_attention",
+    )
 """
 
 from time import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
-from flowcept.commons.flowcept_dataclasses.task_object import TaskObject
+from flowcept.commons.flowcept_dataclasses.task_object import Status, TaskObject
 from flowcept.commons.flowcept_dataclasses.workflow_object import WorkflowObject
-from flowcept.commons.vocabulary import Status
 from flowcept.flowceptor.adapters.base_interceptor import BaseInterceptor
 
 
@@ -77,7 +78,11 @@ class VLLMInterceptor(BaseInterceptor):
         return cls._instance
 
     def send_model_workflow(
-        self, workflow_id: str, conf: Dict[str, Any], parent_workflow_id: Optional[str] = None
+        self,
+        workflow_id: str,
+        conf: Dict[str, Any],
+        parent_workflow_id: Optional[str] = None,
+        attention_config: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Register the served model as a workflow, once per run.
 
@@ -98,6 +103,10 @@ class VLLMInterceptor(BaseInterceptor):
             dtype, max_model_len, ...).
         parent_workflow_id : str, optional
             The caller's workflow, if the vLLM run is nested inside one.
+        attention_config : dict, optional
+            Connector settings constant for the run. Recorded here for the same
+            reason as `conf`: repeating it on every task is duplication that can
+            drift.
 
         Returns
         -------
@@ -108,15 +117,17 @@ class VLLMInterceptor(BaseInterceptor):
         workflow_obj.parent_workflow_id = parent_workflow_id
         workflow_obj.name = conf.get("model", "vllm")
         workflow_obj.conf = conf
+        if attention_config:
+            workflow_obj.attention_config = attention_config
         return self.send_workflow_message(workflow_obj)
 
     def prepare_task_msg(
         self,
         workflow_id: str,
         request_id: str,
-        series: Union[List[float], Dict[str, List[float]]],
-        prompt_token_ids: List[int],
-        metadata: Dict[str, Any],
+        attention_stats: Dict[str, Any],
+        num_prompt_tokens: int,
+        num_decode_tokens: int,
         started_at: Optional[float] = None,
         activity: Optional[str] = None,
     ) -> TaskObject:
@@ -125,6 +136,10 @@ class VLLMInterceptor(BaseInterceptor):
         Overrides `BaseInterceptor.prepare_task_msg` (which otherwise raises
         `NotImplementedError`) with the params `callback`/`capture_request`
         actually provide, rather than the generic `*args, **kwargs`.
+
+        `num_prompt_tokens`/`num_decode_tokens` are passed rather than derived:
+        they used to be inferred from the length of an inline series, and the
+        series now lives in a file.
         """
         # Precedence: what the connector asked for, then settings.yaml, then a
         # neutral default. Distinct activities let several connectors write into
@@ -149,44 +164,17 @@ class VLLMInterceptor(BaseInterceptor):
         # One per-token series or several named ones. A bare list is kept under
         # `score` so older consumers are unaffected; a dict is passed through
         # under its own keys, whatever the connector chose to call them.
-        if isinstance(series, dict):
-            generated = dict(series)
-            # A value is either a per-token series (flat) or a matrix whose rows
-            # are per-token (e.g. one row per decode step). Only the flat ones
-            # define the token count, and only they must agree with each other.
-            flat = {k: v for k, v in series.items()
-                    if not (v and isinstance(v[0], (list, tuple)))}
-            lengths = {len(v) for v in flat.values()}
-            if len(lengths) > 1:
-                raise ValueError(
-                    f"per-token series must be equal length, got "
-                    f"{ {k: len(v) for k, v in flat.items()} }"
-                )
-            num_computed = lengths.pop() if lengths else 0
-            for key, value in series.items():
-                if key in flat or not value:
-                    continue
-                # Matrices are rectangular, but their row width is the
-                # connector's business: [decode steps x prefill tokens] and
-                # [decode steps x top_k] are both legitimate, so do not tie the
-                # width to the per-token count.
-                widths = {len(row) for row in value}
-                if len(widths) > 1:
-                    raise ValueError(
-                        f"matrix {key!r} is ragged: row widths {sorted(widths)}"
-                    )
-        else:
-            generated = {"score": series}
-            num_computed = len(series)
-
         task_msg.used = {
-            "request_id": request_id,
-            "prompt_token_ids": prompt_token_ids,
-            "num_prompt_tokens": len(prompt_token_ids),
-            "num_computed_tokens": num_computed,
+            "request_id": request_id.rsplit(":g", 1)[0],
+            "num_prompt_tokens": num_prompt_tokens,
+            "num_decode_tokens": num_decode_tokens,
         }
-        task_msg.generated = generated
-        task_msg.custom_metadata = metadata
+        # Top level rather than under `generated`: the statistics themselves are
+        # in the file this points at, so the record carries a reference, not the
+        # data. That keeps a record flat in size -- a long-context request would
+        # otherwise serialise to hundreds of megabytes, past what a message
+        # queue will accept.
+        task_msg.attention_stats = attention_stats
 
         if self.telemetry_capture is not None:
             task_msg.telemetry_at_end = self.telemetry_capture.capture()
@@ -197,24 +185,29 @@ class VLLMInterceptor(BaseInterceptor):
         self,
         workflow_id: str,
         request_id: str,
-        series: Union[List[float], Dict[str, List[float]]],
-        prompt_token_ids: List[int],
-        metadata: Dict[str, Any],
+        attention_stats: Dict[str, Any],
+        num_prompt_tokens: int,
+        num_decode_tokens: int,
         started_at: Optional[float] = None,
         activity: Optional[str] = None,
     ) -> None:
-        """Capture one finished request. Convenience wrapper over `callback`."""
+        """Capture one finished request, by reference to its statistics file.
+
+        `attention_stats` is the descriptor written by the connector: uri,
+        format, byte size, checksum, and a manifest of the tensors inside.
+        """
         self.callback(
-            workflow_id, request_id, series, prompt_token_ids, metadata, started_at, activity
+            workflow_id, request_id, attention_stats, num_prompt_tokens,
+            num_decode_tokens, started_at, activity
         )
 
     def callback(
         self,
         workflow_id: str,
         request_id: str,
-        series: Union[List[float], Dict[str, List[float]]],
-        prompt_token_ids: List[int],
-        metadata: Dict[str, Any],
+        attention_stats: Dict[str, Any],
+        num_prompt_tokens: int,
+        num_decode_tokens: int,
         started_at: Optional[float] = None,
         activity: Optional[str] = None,
     ) -> None:
@@ -225,7 +218,8 @@ class VLLMInterceptor(BaseInterceptor):
         since a completed request is unconditionally worth recording.
         """
         task_msg = self.prepare_task_msg(
-            workflow_id, request_id, series, prompt_token_ids, metadata, started_at, activity
+            workflow_id, request_id, attention_stats, num_prompt_tokens,
+            num_decode_tokens, started_at, activity
         )
         self.intercept(task_msg.to_dict())
 

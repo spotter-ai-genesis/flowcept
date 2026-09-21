@@ -1,12 +1,12 @@
-"""Tests for the vLLM (KV cache token importance) adapter.
+"""Tests for the vLLM adapter.
 
 Real interceptor, real Flowcept buffer, no mocks -- per this repo's testing
 conventions. The adapter deliberately takes plain Python data rather than vLLM
 objects, so these tests need neither vLLM nor a GPU: the boundary being tested
-is "score data in -> correct Flowcept task/workflow out".
+is "statistics reference in -> correct Flowcept task/workflow out".
 
-End-to-end capture against a live vLLM engine is covered separately, in the
-experiments repo (`experiments/vllm-kvnorm/`), since that does require a GPU.
+End-to-end capture against a live vLLM engine is covered by the connector's own
+`tests/e2e_smoke.py`, which does require a GPU.
 """
 
 import unittest
@@ -23,6 +23,37 @@ MODEL_CONF = {
     "architectures": ["OPTForCausalLM"],
 }
 
+ATTENTION_CONFIG = {
+    "connector": "vllm-attn-connector",
+    "metric": "decode_attention",
+    "top_pct": 10.0,
+    "chunk_size": 32,
+    "num_query_heads": 12,
+    "num_layers_scored": 12,
+}
+
+
+def stats(uri="file:///prov/wf/0-abc123_g0.safetensors", **over):
+    """A statistics-file descriptor, as the connector writes one."""
+    d = {
+        "uri": uri,
+        "format": "safetensors",
+        "bytes": 4096,
+        "sha256": "0" * 64,
+        "kv_cache_group_id": 0,
+        "written_by_tp_rank": 0,
+        "segment_mode": "fixed",
+        "decode_steps_dropped": 0,
+        "decode_steps_nonfinite": 0,
+        "restarts": 0,
+        "tensors": {
+            "attn_sum": {"shape": [3], "dtype": "float32"},
+            "val_all_max": {"shape": [4, 2], "dtype": "float32"},
+        },
+    }
+    d.update(over)
+    return d
+
 
 class TestVLLMInterceptor(unittest.TestCase):
     """Real (no-mock) tests for VLLMInterceptor's request capture."""
@@ -34,9 +65,10 @@ class TestVLLMInterceptor(unittest.TestCase):
             VLLMInterceptor.get_instance().capture_request(
                 workflow_id=wf_id,
                 request_id="0-abc123",
-                scores=[0.13, 0.16, 0.14, 0.15],
-                prompt_token_ids=[2, 133, 812],
-                metadata={"num_layers": 12, "num_kv_heads": 12},
+                attention_stats=stats(),
+                num_prompt_tokens=3,
+                num_decode_tokens=4,
+                activity="decode_attention",
             )
             buf = fc.get_buffer()
 
@@ -45,29 +77,60 @@ class TestVLLMInterceptor(unittest.TestCase):
         task = tasks[0]
         self.assertEqual(task["workflow_id"], wf_id)
         self.assertEqual(task["status"], "FINISHED")
-        self.assertEqual(task["activity_id"], "kv_token_importance")
-        self.assertEqual(task["generated"]["score"], [0.13, 0.16, 0.14, 0.15])
-        self.assertEqual(task["used"]["prompt_token_ids"], [2, 133, 812])
+        self.assertEqual(task["activity_id"], "decode_attention")
         self.assertEqual(task["used"]["num_prompt_tokens"], 3)
-        self.assertEqual(task["used"]["num_computed_tokens"], 4)
-        self.assertEqual(task["custom_metadata"]["num_layers"], 12)
+        self.assertEqual(task["used"]["num_decode_tokens"], 4)
+        self.assertEqual(
+            task["attention_stats"]["uri"], "file:///prov/wf/0-abc123_g0.safetensors"
+        )
+        self.assertEqual(sorted(task["attention_stats"]["tensors"]), ["attn_sum", "val_all_max"])
 
-    def test_one_score_per_token(self):
-        """num_computed_tokens must track the score vector, not the prompt."""
-        with Flowcept("vllm", workflow_name="test_vllm_lengths") as fc:
-            VLLMInterceptor.get_instance().capture_request(
-                workflow_id=Flowcept.current_workflow_id,
-                request_id="0-lengths",
-                scores=[0.1] * 29,
-                prompt_token_ids=[1] * 6,
-                metadata={},
-            )
+    def test_record_size_does_not_grow_with_the_prompt(self):
+        """Why the statistics live in a file: the record must stay small.
+
+        A 128k-token prompt used to serialise its arrays inline, past what a
+        message queue accepts. The descriptor is the same size either way.
+        """
+        import json
+
+        with Flowcept("vllm", workflow_name="test_vllm_size") as fc:
+            for name, n_prompt in (("0-small", 8), ("0-large", 131072)):
+                VLLMInterceptor.get_instance().capture_request(
+                    workflow_id=Flowcept.current_workflow_id,
+                    request_id=name,
+                    attention_stats=stats(uri=f"file:///prov/wf/{name}_g0.safetensors"),
+                    num_prompt_tokens=n_prompt,
+                    num_decode_tokens=16,
+                )
             buf = fc.get_buffer()
 
-        task = next(r for r in buf if r.get("task_id") == "0-lengths")
-        self.assertEqual(len(task["generated"]["score"]), 29)
-        self.assertEqual(task["used"]["num_computed_tokens"], 29)
-        self.assertEqual(task["used"]["num_prompt_tokens"], 6)
+        by_id = {r["task_id"]: r for r in buf if r.get("task_id") in ("0-small", "0-large")}
+        small = len(json.dumps(by_id["0-small"]))
+        large = len(json.dumps(by_id["0-large"]))
+        # only the recorded token count differs, a handful of characters
+        self.assertLess(abs(large - small), 32)
+
+    def test_group_suffix_is_stripped_from_the_request_id(self):
+        """Multi-group models emit one task per group, all one request."""
+        with Flowcept("vllm", workflow_name="test_vllm_groups") as fc:
+            for gid in (0, 1):
+                VLLMInterceptor.get_instance().capture_request(
+                    workflow_id=Flowcept.current_workflow_id,
+                    request_id=f"0-grouped:g{gid}",
+                    attention_stats=stats(kv_cache_group_id=gid),
+                    num_prompt_tokens=5,
+                    num_decode_tokens=2,
+                )
+            buf = fc.get_buffer()
+
+        tasks = sorted(
+            (r for r in buf if str(r.get("task_id", "")).startswith("0-grouped")),
+            key=lambda r: r["task_id"],
+        )
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual([t["task_id"] for t in tasks], ["0-grouped:g0", "0-grouped:g1"])
+        # the task id keeps the group, `used.request_id` does not
+        self.assertEqual({t["used"]["request_id"] for t in tasks}, {"0-grouped"})
 
     def test_multiple_requests_produce_multiple_tasks(self):
         with Flowcept("vllm", workflow_name="test_vllm_multi") as fc:
@@ -76,9 +139,9 @@ class TestVLLMInterceptor(unittest.TestCase):
                 VLLMInterceptor.get_instance().capture_request(
                     workflow_id=wf_id,
                     request_id=f"{i}-multi",
-                    scores=[0.1 * (i + 1)],
-                    prompt_token_ids=[i],
-                    metadata={},
+                    attention_stats=stats(),
+                    num_prompt_tokens=i + 1,
+                    num_decode_tokens=1,
                 )
             buf = fc.get_buffer()
 
@@ -87,10 +150,14 @@ class TestVLLMInterceptor(unittest.TestCase):
             key=lambda r: r["task_id"],
         )
         self.assertEqual(len(tasks), 3)
-        self.assertEqual([t["used"]["prompt_token_ids"] for t in tasks], [[0], [1], [2]])
+        self.assertEqual([t["used"]["num_prompt_tokens"] for t in tasks], [1, 2, 3])
 
-    def test_model_workflow_carries_tokenizer_identity(self):
+    def test_model_workflow_carries_tokenizer_and_attention_config(self):
         """Without the tokenizer on the workflow, prompt_token_ids is undecodable.
+
+        `attention_config` rides here for the same reason: it is constant for
+        the run, so repeating it on every task would be duplication that can
+        drift.
 
         Uses a workflow id the controller has not already claimed, which is the
         real deployment shape: vLLM runs its scheduler in a separate EngineCore
@@ -101,15 +168,18 @@ class TestVLLMInterceptor(unittest.TestCase):
 
         with Flowcept("vllm", workflow_name="test_vllm_workflow") as fc:
             returned = VLLMInterceptor.get_instance().send_model_workflow(
-                vllm_wf_id, MODEL_CONF, parent_workflow_id=Flowcept.current_workflow_id
+                vllm_wf_id,
+                MODEL_CONF,
+                parent_workflow_id=Flowcept.current_workflow_id,
+                attention_config=ATTENTION_CONFIG,
             )
             parent_id = Flowcept.current_workflow_id
             VLLMInterceptor.get_instance().capture_request(
                 workflow_id=vllm_wf_id,
                 request_id="0-wf",
-                scores=[0.1, 0.2],
-                prompt_token_ids=[2, 133],
-                metadata={},
+                attention_stats=stats(),
+                num_prompt_tokens=2,
+                num_decode_tokens=2,
             )
             buf = fc.get_buffer()
 
@@ -128,6 +198,12 @@ class TestVLLMInterceptor(unittest.TestCase):
         self.assertEqual(conf["tokenizer"], "facebook/opt-125m")
         self.assertEqual(conf["model"], "facebook/opt-125m")
         self.assertEqual(conf["max_model_len"], 512)
+
+        ac = workflows[0]["attention_config"]
+        self.assertEqual(ac["metric"], "decode_attention")
+        self.assertEqual(ac["top_pct"], 10.0)
+        # needed to decode topk_head, so it must be a field of its own
+        self.assertEqual(ac["num_query_heads"], 12)
 
         # The task must be joinable back to that workflow.
         task = next(r for r in buf if r.get("task_id") == "0-wf")
